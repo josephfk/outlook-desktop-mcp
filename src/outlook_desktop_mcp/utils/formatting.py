@@ -22,6 +22,48 @@ def strip_html(html: str) -> str:
     return text
 
 
+def get_item_categories(item) -> list[str]:
+    """Return an Outlook item's categories as a safely parsed list."""
+    try:
+        raw = getattr(item, "Categories", "") or ""
+    except Exception:
+        return []
+
+    try:
+        return [value.strip() for value in raw.split(",") if value.strip()]
+    except Exception:
+        return []
+
+
+def merge_categories(
+    current: list[str],
+    requested: list[str],
+    mode: str,
+) -> list[str]:
+    """Apply a category update mode without losing unrelated categories."""
+    if mode == "replace":
+        return list(requested)
+
+    if mode == "add":
+        updated = list(current)
+        seen = {value.casefold() for value in updated}
+        for value in requested:
+            if value.casefold() not in seen:
+                updated.append(value)
+                seen.add(value.casefold())
+        return updated
+
+    if mode == "remove":
+        remove_set = {value.casefold() for value in requested}
+        return [
+            value
+            for value in current
+            if value.casefold() not in remove_set
+        ]
+
+    raise ValueError("mode must be one of: replace, add, remove")
+
+
 def format_email_summary(item) -> dict:
     """Extract key fields from an Outlook MailItem into a dict."""
     return {
@@ -33,6 +75,7 @@ def format_email_summary(item) -> dict:
         "unread": bool(item.UnRead),
         "has_attachments": bool(item.Attachments.Count > 0),
         "attachment_count": item.Attachments.Count,
+        "categories": get_item_categories(item),
     }
 
 
@@ -64,6 +107,7 @@ def format_event_summary(item) -> dict:
         "meeting_status": MEETING_STATUS_NAMES.get(item.MeetingStatus, "unknown"),
         "required_attendees": item.RequiredAttendees or "",
         "optional_attendees": item.OptionalAttendees or "",
+        "categories": get_item_categories(item),
     }
 
 
@@ -75,7 +119,6 @@ def format_event_full(item, body_max_length: int = 5000) -> dict:
     result["reminder_minutes"] = (
         item.ReminderMinutesBeforeStart if item.ReminderSet else None
     )
-    result["categories"] = item.Categories or ""
     result["response_status"] = RESPONSE_NAMES.get(item.ResponseStatus, "unknown")
     return result
 
@@ -94,7 +137,7 @@ def format_task_summary(item) -> dict:
         "start_date": str(item.StartDate) if str(item.StartDate) != "01/01/4501" else None,
         "importance": IMPORTANCE_NAMES.get(item.Importance, "normal"),
         "complete": bool(item.Complete),
-        "categories": item.Categories or "",
+        "categories": get_item_categories(item),
         "owner": item.Owner or "",
     }
 

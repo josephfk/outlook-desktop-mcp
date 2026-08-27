@@ -11,6 +11,7 @@ import sys
 import json
 import logging
 import re
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
@@ -44,6 +45,8 @@ from outlook_desktop_mcp.utils.formatting import (
     format_event_full,
     format_task_summary,
     format_task_full,
+    get_item_categories as _get_item_categories,
+    merge_categories,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
 
@@ -137,6 +140,14 @@ def _require_store(namespace, account: str = ""):
     if store is None:
         raise ValueError(f"Account '{account}' not found. Use list_accounts to see available accounts.")
     return store
+
+
+def _get_item_from_id(namespace, entry_id: str, account: str = ""):
+    """Retrieve an Outlook item, optionally scoped to a specific account store."""
+    if account:
+        store = _require_store(namespace, account)
+        return namespace.GetItemFromID(entry_id, store.StoreID)
+    return namespace.GetItemFromID(entry_id)
 
 
 # --- Helper: resolve folder by name ---
@@ -321,7 +332,7 @@ async def list_emails(
 
     Returns a JSON array of email summaries sorted by received time (newest
     first). Each summary includes entry_id, subject, sender, sender_name,
-    received_time, unread status, and attachment info.
+    received_time, unread status, attachment info, and categories.
 
     Use the entry_id from results to read full content with read_email,
     or to perform actions like mark_as_read, move_email, or reply_email.
@@ -341,7 +352,7 @@ async def list_emails(
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
-        JSON array of email summary objects.
+        JSON array of email summary objects, including categories as arrays.
     """
     def _list(outlook, namespace, folder, count, unread_only, start_date, end_date, account):
         count = min(max(1, count), 200)
@@ -399,7 +410,7 @@ async def read_email(
     """Read the full content of a specific email.
 
     Retrieves complete email details including body text, recipients, CC,
-    and metadata. Provide EITHER entry_id (preferred, exact match) OR
+    categories, and metadata. Provide EITHER entry_id (preferred, exact match) OR
     subject_search (finds most recent match by subject substring).
 
     Args:
@@ -415,11 +426,12 @@ async def read_email(
 
     Returns:
         JSON object with full email details (entry_id, subject, sender,
-        sender_name, received_time, unread, to, cc, body, attachment info).
+        sender_name, received_time, unread, to, cc, body, attachment info,
+        and categories as an array).
     """
     def _read(outlook, namespace, entry_id, subject_search, folder, account):
         if entry_id:
-            item = namespace.GetItemFromID(entry_id)
+            item = _get_item_from_id(namespace, entry_id, account)
             return json.dumps(format_email_full(item), indent=2, default=str)
 
         if not subject_search:
@@ -715,8 +727,8 @@ async def search_emails(
     """Search for emails in Outlook using text search.
 
     Searches email subjects and bodies using Outlook's DASL filter.
-    Results are sorted by received time (newest first). Each result
-    includes entry_id for further operations.
+    Results are sorted by received time (newest first). Each result includes
+    entry_id for further operations and categories as an array.
 
     Args:
         query: The search term (case-insensitive substring match).
@@ -732,7 +744,7 @@ async def search_emails(
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
-        JSON array of matching email summaries, or an error.
+        JSON array of matching email summaries including categories, or an error.
     """
     def _search(outlook, namespace, query, folder, count, start_date, end_date, account):
         count = min(max(1, count), 200)
@@ -808,7 +820,7 @@ async def list_events(
     Returns a JSON array of event summaries within a date range, sorted by
     start time. Includes recurring event occurrences. Each summary has
     entry_id, subject, start, end, duration, location, organizer, attendees,
-    and status info.
+    status info, and categories as an array.
 
     Use entry_id from results with get_event, update_event, delete_event,
     or respond_to_meeting.
@@ -822,7 +834,7 @@ async def list_events(
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
-        JSON array of event summary objects.
+        JSON array of event summary objects, including categories.
     """
     def _list(outlook, namespace, start_date, end_date, count, account):
         count = min(max(1, count), 200)
@@ -871,7 +883,7 @@ async def get_event(entry_id: str, account: str = "") -> str:
     """Read the full details of a specific calendar event.
 
     Retrieves complete event information including body/description,
-    attendees, recurrence status, reminders, and response status.
+    attendees, recurrence status, reminders, response status, and categories.
 
     Args:
         entry_id: The unique Outlook EntryID of the event. Get this from
@@ -880,14 +892,10 @@ async def get_event(entry_id: str, account: str = "") -> str:
             if entry_id is ambiguous across stores.
 
     Returns:
-        JSON object with full event details.
+        JSON object with full event details, including categories as an array.
     """
     def _get(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_from_id(namespace, entry_id, account)
         return json.dumps(format_event_full(item), indent=2, default=str)
 
     try:
@@ -1248,7 +1256,7 @@ async def search_events(
     """Search for calendar events by keyword.
 
     Searches event subjects within a date range. Results are sorted by
-    start time. Includes recurring event occurrences.
+    start time. Includes recurring event occurrences and category arrays.
 
     Args:
         query: The search term (case-insensitive substring match on subject).
@@ -1261,7 +1269,7 @@ async def search_events(
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
-        JSON array of matching event summaries.
+        JSON array of matching event summaries, including categories.
     """
     def _search(outlook, namespace, query, start_date, end_date, count, account):
         count = min(max(1, count), 200)
@@ -1360,14 +1368,10 @@ async def get_task(entry_id: str, account: str = "") -> str:
             if entry_id is ambiguous across stores.
 
     Returns:
-        JSON object with full task details including body.
+        JSON object with full task details including body and categories as an array.
     """
     def _get(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_from_id(namespace, entry_id, account)
         return json.dumps(format_task_full(item), indent=2, default=str)
 
     try:
@@ -1639,15 +1643,47 @@ async def list_categories(account: str = "") -> str:
 
 
 @mcp.tool()
+async def get_item_categories(entry_id: str, account: str = "") -> str:
+    """Get the categories currently applied to an Outlook item.
+
+    Works with emails, calendar events, and tasks where Outlook supports
+    categories. Category values are returned as a JSON array.
+
+    Args:
+        entry_id: The EntryID of the email, event, or task to inspect.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        JSON object containing entry_id, subject, and categories.
+    """
+    def _get(outlook, namespace, entry_id, account):
+        item = _get_item_from_id(namespace, entry_id, account)
+        return json.dumps({
+            "entry_id": item.EntryID,
+            "subject": item.Subject or "(no subject)",
+            "categories": _get_item_categories(item),
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_get, entry_id, account)
+    except Exception as e:
+        return f"Error getting item categories: {format_com_error(e)}"
+
+
+@mcp.tool()
 async def set_category(
     entry_id: str,
     categories: str,
     account: str = "",
+    mode: Literal["replace", "add", "remove"] = "replace",
 ) -> str:
-    """Set categories on an email, event, or task.
+    """Replace, add, or remove categories on an email, event, or task.
 
-    Replaces any existing categories on the item. Use comma-separated
-    values for multiple categories.
+    Use comma-separated values for multiple categories. The default mode is
+    "replace" for backward compatibility. "add" preserves existing categories
+    and avoids case-insensitive duplicates. "remove" preserves all categories
+    except case-insensitive matches for the requested names.
 
     Args:
         entry_id: The EntryID of the item to categorize.
@@ -1656,17 +1692,27 @@ async def set_category(
             clear all categories.
         account: Optional. Account display name (or substring). Only needed
             if entry_id is ambiguous across stores.
+        mode: How to apply the requested categories: "replace" (default),
+            "add", or "remove".
 
     Returns:
         Confirmation with the item subject and applied categories.
     """
-    def _set(outlook, namespace, entry_id, categories, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
-        item.Categories = categories
+    def _set(outlook, namespace, entry_id, categories, account, mode):
+        item = _get_item_from_id(namespace, entry_id, account)
+        requested = [
+            value.strip()
+            for value in categories.split(",")
+            if value.strip()
+        ]
+
+        updated = merge_categories(
+            _get_item_categories(item),
+            requested,
+            mode,
+        )
+
+        item.Categories = ", ".join(updated)
         item.Save()
         return (
             f"Categories set on '{item.Subject}': "
@@ -1674,7 +1720,7 @@ async def set_category(
         )
 
     try:
-        return await bridge.call(_set, entry_id, categories, account)
+        return await bridge.call(_set, entry_id, categories, account, mode)
     except Exception as e:
         return f"Error setting categories: {format_com_error(e)}"
 
