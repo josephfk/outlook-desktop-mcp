@@ -26,6 +26,7 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
     OL_FOLDER_TASKS,
+    OL_FOLDER_TODO,
     OL_MEETING,
     OL_MEETING_CANCELED,
     OL_RESPONSE_TENTATIVE,
@@ -34,9 +35,6 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_REQUIRED,
     OL_OPTIONAL,
     OL_TASK_ITEM,
-    OL_TASK_COMPLETE,
-    TASK_STATUS_NAMES,
-    IMPORTANCE_NAMES,
 )
 from outlook_desktop_mcp.utils.formatting import (
     format_email_summary,
@@ -47,6 +45,21 @@ from outlook_desktop_mcp.utils.formatting import (
     format_task_full,
     get_item_categories as _get_item_categories,
     merge_categories,
+)
+from outlook_desktop_mcp.utils.attachments import (
+    classify_item_attachments,
+    resolve_attachment_com_index,
+    serialize_attachments,
+)
+from outlook_desktop_mcp.utils.tasks import (
+    apply_task_fields,
+    compute_reminder_time,
+    is_outlook_task,
+    normalize_importance_name,
+    normalize_status_name,
+    outlook_date_or_none,
+    parse_iso_datetime,
+    task_matches_filters,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
 
@@ -103,7 +116,7 @@ mcp = FastMCP(
         "- Email: send, list, read, search, reply, mark read/unread, move, attachments\n"
         "- Calendar: list events, create appointments/meetings, update, delete, "
         "respond to invites, search events\n"
-        "- Tasks: create, list, complete, update, delete to-do items\n"
+        "- Tasks: create, list, update, complete, delete to-do items\n"
         "- Categories: list and set color categories on any item\n"
         "- Rules: list and manage mail rules\n"
         "- Out of Office: check auto-reply status\n"
@@ -332,7 +345,9 @@ async def list_emails(
 
     Returns a JSON array of email summaries sorted by received time (newest
     first). Each summary includes entry_id, subject, sender, sender_name,
-    received_time, unread status, attachment info, and categories.
+    received_time, unread status, visible attachment count, and categories.
+    attachment_count is the paperclip file count; raw_attachment_count is
+    the unfiltered COM collection (includes signature/inline images).
 
     Use the entry_id from results to read full content with read_email,
     or to perform actions like mark_as_read, move_email, or reply_email.
@@ -426,8 +441,8 @@ async def read_email(
 
     Returns:
         JSON object with full email details (entry_id, subject, sender,
-        sender_name, received_time, unread, to, cc, body, attachment info,
-        and categories as an array).
+        sender_name, received_time, unread, to, cc, body, visible
+        attachments, and categories as an array).
     """
     def _read(outlook, namespace, entry_id, subject_search, folder, account):
         if entry_id:
@@ -1311,49 +1326,98 @@ async def search_events(
 # TASK TOOLS
 # =====================================================================
 
+def _task_folder(store, source: str):
+    key = (source or "tasks").strip().lower()
+    if key in ("tasks", "task"):
+        return store.GetDefaultFolder(OL_FOLDER_TASKS)
+    if key in ("todo", "to-do", "to_do"):
+        return store.GetDefaultFolder(OL_FOLDER_TODO)
+    raise ValueError("source must be 'tasks' (default) or 'todo'")
+
+
 @mcp.tool()
 async def list_tasks(
     include_completed: bool = False,
     count: int = 20,
     account: str = "",
+    source: str = "tasks",
+    status: str = "",
+    importance: str = "",
+    category: str = "",
+    due_before: str = "",
 ) -> str:
-    """List tasks from the Outlook Tasks folder.
+    """List Outlook tasks.
 
-    Returns a JSON array of task summaries sorted by due date. Each task
-    includes entry_id, subject, status, percent_complete, due_date,
-    importance, and categories.
+    Returns a JSON array of task summaries sorted by due date. Only real
+    TaskItems (Class 48) are included — flagged mail in the To-Do folder
+    is skipped. Default source is the Tasks folder, not Microsoft To Do.
 
     Args:
-        include_completed: If true, include completed tasks. Default false
-            (only pending/in-progress tasks).
+        include_completed: If true, include completed tasks. Default false.
+            Ignored when status='complete' (completed tasks are returned).
         count: Maximum number of tasks to return. Default 20.
         account: Optional. Account display name (or substring) to target.
-            Default: primary account. Use list_accounts to see available accounts.
+        source: 'tasks' (default, Outlook Tasks folder) or 'todo'
+            (To-Do folder, still TaskItems only).
+        status: Optional. not_started, in_progress, waiting, deferred, complete.
+        importance: Optional. low, normal, or high.
+        category: Optional. Case-insensitive category name match.
+        due_before: Optional. ISO 8601 datetime; only tasks due on or before
+            this instant. Undated tasks are excluded when this is set.
 
     Returns:
         JSON array of task summary objects.
     """
-    def _list(outlook, namespace, include_completed, count, account):
+    def _list(
+        outlook, namespace, include_completed, count, account, source,
+        status, importance, category, due_before,
+    ):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
-        folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
+        folder = _task_folder(store, source)
+        if status:
+            normalize_status_name(status)
+        if importance:
+            normalize_importance_name(importance)
+        if due_before:
+            parse_iso_datetime(due_before)
         items = folder.Items
         items.Sort("[DueDate]")
 
-        if not include_completed:
+        want_complete = status.strip().lower() in {
+            "complete", "completed", "done",
+        }
+        if not include_completed and not want_complete:
             items = items.Restrict("[Complete] = False")
 
         results = []
-        limit = min(count, items.Count)
-        for i in range(limit):
+        for item in items:
             try:
-                results.append(format_task_summary(items.Item(i + 1)))
+                if not is_outlook_task(item):
+                    continue
+                summary = format_task_summary(item)
+                if not task_matches_filters(
+                    summary,
+                    status=status,
+                    importance=importance,
+                    category=category,
+                    due_before=due_before,
+                ):
+                    continue
+                results.append(summary)
             except Exception:
                 continue
+            if len(results) >= count:
+                break
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, include_completed, count, account)
+        return await bridge.call(
+            _list, include_completed, count, account, source,
+            status, importance, category, due_before,
+        )
+    except ValueError as e:
+        return f"Error listing tasks: {e}"
     except Exception as e:
         return f"Error listing tasks: {format_com_error(e)}"
 
@@ -1368,10 +1432,13 @@ async def get_task(entry_id: str, account: str = "") -> str:
             if entry_id is ambiguous across stores.
 
     Returns:
-        JSON object with full task details including body and categories as an array.
+        JSON object with full task details including body, reminder_time,
+        and categories as an array.
     """
     def _get(outlook, namespace, entry_id, account):
         item = _get_item_from_id(namespace, entry_id, account)
+        if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
+            return err
         return json.dumps(format_task_full(item), indent=2, default=str)
 
     try:
@@ -1385,8 +1452,11 @@ async def create_task(
     subject: str,
     body: str = "",
     due_date: str = "",
+    start_date: str = "",
     importance: str = "normal",
+    status: str = "",
     reminder_minutes: int = 0,
+    reminder_time: str = "",
     account: str = "",
 ) -> str:
     """Create a new task in Outlook.
@@ -1395,58 +1465,158 @@ async def create_task(
         subject: The task title.
         body: Optional. Task description or notes.
         due_date: Optional. Due date in ISO 8601 format (e.g. "2026-03-01").
+        start_date: Optional. Start date in ISO 8601 format.
         importance: Optional. "low", "normal" (default), or "high".
-        reminder_minutes: Optional. Minutes before due date to remind.
-            Default 0 (no reminder).
+        status: Optional. not_started (default), in_progress, waiting,
+            deferred, or complete.
+        reminder_minutes: Optional. Minutes before due_date to remind.
+            Requires due_date. Ignored if reminder_time is set. Default 0.
+        reminder_time: Optional. Absolute reminder datetime (ISO 8601).
+            Task reminders use ReminderTime, not calendar minutes-before.
         account: Optional. Account display name (or substring) to create
             the task in. Default: primary account.
 
     Returns:
         Confirmation with task subject and entry_id.
     """
-    def _create(outlook, namespace, subject, body, due_date, importance,
-                reminder_minutes, account):
+    def _create(
+        outlook, namespace, subject, body, due_date, start_date, importance,
+        status, reminder_minutes, reminder_time, account,
+    ):
         task = outlook.CreateItem(OL_TASK_ITEM)
-        # Move to correct store's tasks folder if account specified
         if account:
             store = _require_store(namespace, account)
             tasks_folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
             task.Move(tasks_folder)
             task = namespace.GetItemFromID(task.EntryID)
-        task.Subject = subject
-        if body:
-            task.Body = body
-        if due_date:
-            task.DueDate = due_date
-        imp_map = {"low": 0, "normal": 1, "high": 2}
-        task.Importance = imp_map.get(importance.lower(), 1)
-        if reminder_minutes > 0:
-            task.ReminderSet = True
-            task.ReminderMinutesBeforeStart = reminder_minutes
-        else:
-            task.ReminderSet = False
+        apply_task_fields(
+            task,
+            subject=subject,
+            body=body or None,
+            due_date=due_date or None,
+            start_date=start_date or None,
+            importance=importance or None,
+            status=status or None,
+            reminder_time=reminder_time or None,
+            reminder_minutes=reminder_minutes or None,
+            clear_reminder=not (reminder_time or reminder_minutes),
+        )
         task.Save()
         return json.dumps({
             "status": "created",
             "subject": task.Subject,
             "entry_id": task.EntryID,
-            "due_date": str(task.DueDate) if due_date else None,
+            "due_date": outlook_date_or_none(task.DueDate),
         }, indent=2, default=str)
 
     try:
         return await bridge.call(
-            _create, subject, body, due_date, importance, reminder_minutes,
-            account,
+            _create, subject, body, due_date, start_date, importance,
+            status, reminder_minutes, reminder_time, account,
         )
+    except ValueError as e:
+        return f"Error creating task: {e}"
     except Exception as e:
         return f"Error creating task: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def update_task(
+    entry_id: str,
+    subject: str = "",
+    body: str = "",
+    due_date: str = "",
+    start_date: str = "",
+    status: str = "",
+    percent_complete: int = -1,
+    importance: str = "",
+    reminder_time: str = "",
+    reminder_minutes: int = 0,
+    clear_reminder: bool = False,
+    account: str = "",
+) -> str:
+    """Update an existing Outlook task.
+
+    Only fields you provide are changed. Use status to complete or
+    uncomplete (e.g. status='not_started'). Pass due_date='none' to clear
+    a due date.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the task.
+        subject: Optional. New title.
+        body: Optional. New notes.
+        due_date: Optional. ISO 8601 due date, or 'none' to clear.
+        start_date: Optional. ISO 8601 start date, or 'none' to clear.
+        status: Optional. not_started, in_progress, waiting, deferred, complete.
+        percent_complete: Optional. 0-100. -1 (default) leaves it unchanged.
+            100 marks the task complete.
+        importance: Optional. low, normal, or high.
+        reminder_time: Optional. Absolute reminder datetime (ISO 8601).
+        reminder_minutes: Optional. Minutes before due date. Uses the new
+            due_date if set, otherwise the task's existing due date.
+        clear_reminder: If true, turn the reminder off.
+        account: Optional. Account display name (or substring).
+
+    Returns:
+        JSON with the updated task details.
+    """
+    def _update(
+        outlook, namespace, entry_id, subject, body, due_date, start_date,
+        status, percent_complete, importance, reminder_time, reminder_minutes,
+        clear_reminder, account,
+    ):
+        item = _get_item_from_id(namespace, entry_id, account)
+        if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
+            return err
+
+        resolved_reminder = reminder_time
+        minutes = reminder_minutes or 0
+        if minutes > 0 and not resolved_reminder:
+            due_for_reminder = due_date or outlook_date_or_none(item.DueDate) or ""
+            computed = compute_reminder_time(
+                reminder_minutes=minutes,
+                due_date=due_for_reminder,
+            )
+            resolved_reminder = computed.isoformat() if computed else ""
+            minutes = 0
+
+        apply_task_fields(
+            item,
+            subject=subject or None,
+            body=body or None,
+            due_date=due_date or None,
+            start_date=start_date or None,
+            status=status or None,
+            percent_complete=None if percent_complete < 0 else percent_complete,
+            importance=importance or None,
+            reminder_time=resolved_reminder or None,
+            reminder_minutes=minutes or None,
+            clear_reminder=clear_reminder,
+        )
+        item.Save()
+        return json.dumps({
+            "status": "updated",
+            **format_task_full(item),
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(
+            _update, entry_id, subject, body, due_date, start_date, status,
+            percent_complete, importance, reminder_time, reminder_minutes,
+            clear_reminder, account,
+        )
+    except ValueError as e:
+        return f"Error updating task: {e}"
+    except Exception as e:
+        return f"Error updating task: {format_com_error(e)}"
 
 
 @mcp.tool()
 async def complete_task(entry_id: str, account: str = "") -> str:
     """Mark a task as complete.
 
-    Sets the task status to complete and percent to 100%.
+    Sets the task status to complete and percent to 100%. To uncomplete,
+    use update_task with status='not_started'.
 
     Args:
         entry_id: The unique Outlook EntryID of the task.
@@ -1457,15 +1627,10 @@ async def complete_task(entry_id: str, account: str = "") -> str:
         Confirmation with the task subject.
     """
     def _complete(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_from_id(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
             return err
-        item.Status = OL_TASK_COMPLETE
-        item.PercentComplete = 100
+        apply_task_fields(item, status="complete")
         item.Save()
         return f"Task completed: '{item.Subject}'"
 
@@ -1488,11 +1653,7 @@ async def delete_task(entry_id: str, account: str = "") -> str:
         Confirmation with the task subject.
     """
     def _delete(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_from_id(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
             return err
         subject = item.Subject
@@ -1510,35 +1671,42 @@ async def delete_task(entry_id: str, account: str = "") -> str:
 # =====================================================================
 
 @mcp.tool()
-async def list_attachments(entry_id: str, account: str = "") -> str:
-    """List all attachments on an email or calendar event.
+async def list_attachments(
+    entry_id: str,
+    account: str = "",
+    include_hidden: bool = False,
+) -> str:
+    """List attachments on an email or calendar event.
+
+    By default only user-visible (paperclip) files are returned. Signature
+    images, cid: HTML inlines, hidden MAPI parts, and OLE embeddings are
+    omitted. Pass include_hidden=true to see the raw COM collection.
 
     Args:
         entry_id: The EntryID of the email or event to check for attachments.
         account: Optional. Account display name (or substring). Only needed
             if entry_id is ambiguous across stores.
+        include_hidden: If true, include inline/hidden/OLE parts. Default
+            false. Hidden rows have is_visible=false; use com_index with
+            save_attachment(use_com_index=true) to save those.
 
     Returns:
-        JSON array of attachment objects with index, filename, and size.
+        JSON array of attachment objects with visible_index, com_index,
+        filename, kind, is_visible, content_id, and storage_size (Outlook
+        encoded size, not bytes on disk). index matches visible_index for
+        visible files and is what save_attachment expects by default.
     """
-    def _list(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
-        results = []
-        for i in range(item.Attachments.Count):
-            att = item.Attachments.Item(i + 1)
-            results.append({
-                "index": i + 1,
-                "filename": att.FileName,
-                "size": att.Size,
-            })
-        return json.dumps(results, indent=2, default=str)
+    def _list(outlook, namespace, entry_id, account, include_hidden):
+        item = _get_item_from_id(namespace, entry_id, account)
+        rows = classify_item_attachments(item, match_html_cid=True)
+        return json.dumps(
+            serialize_attachments(rows, include_hidden=include_hidden),
+            indent=2,
+            default=str,
+        )
 
     try:
-        return await bridge.call(_list, entry_id, account)
+        return await bridge.call(_list, entry_id, account, include_hidden)
     except Exception as e:
         return f"Error listing attachments: {format_com_error(e)}"
 
@@ -1549,33 +1717,43 @@ async def save_attachment(
     attachment_index: int = 1,
     save_directory: str = "",
     account: str = "",
+    use_com_index: bool = False,
 ) -> str:
     """Save an attachment from an email or event to disk.
 
-    Downloads the specified attachment to a local directory.
+    Downloads the specified attachment to a local directory. By default
+    attachment_index is the visible paperclip index from list_attachments
+    (not the raw COM slot, which is often a signature image).
 
     Args:
         entry_id: The EntryID of the email or event containing the attachment.
-        attachment_index: Which attachment to save (1-based index). Default 1
-            (first attachment). Use list_attachments to see available indices.
+        attachment_index: Which attachment to save (1-based). Default 1
+            (first visible file). Use list_attachments to see indices.
         save_directory: Directory to save the file to. Default: user's
             Downloads folder.
         account: Optional. Account display name (or substring). Only needed
             if entry_id is ambiguous across stores.
+        use_com_index: If true, attachment_index is the raw COM slot
+            (com_index from list_attachments). Default false.
 
     Returns:
-        The full file path where the attachment was saved, or an error.
+        JSON with path, storage_size (Outlook encoded size), and
+        bytes_on_disk (actual saved file size).
     """
-    def _save(outlook, namespace, entry_id, attachment_index, save_directory, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
-        if attachment_index < 1 or item.Attachments.Count < attachment_index:
-            return f"Error: Only {item.Attachments.Count} attachment(s), requested index {attachment_index}"
+    def _save(
+        outlook, namespace, entry_id, attachment_index, save_directory,
+        account, use_com_index,
+    ):
+        item = _get_item_from_id(namespace, entry_id, account)
+        rows = classify_item_attachments(item, match_html_cid=True)
+        try:
+            com_index = resolve_attachment_com_index(
+                rows, attachment_index, use_com_index=use_com_index,
+            )
+        except ValueError as e:
+            return f"Error: {e}"
 
-        att = item.Attachments.Item(attachment_index)
+        att = item.Attachments.Item(com_index)
         if not save_directory:
             save_directory = os.path.join(os.path.expanduser("~"), "Downloads")
 
@@ -1584,7 +1762,11 @@ async def save_attachment(
         os.makedirs(save_directory, exist_ok=True)
 
         # Strip path separators and dangerous characters from filename
-        safe_name = os.path.basename(att.FileName)
+        try:
+            raw_name = att.FileName or ""
+        except Exception:
+            raw_name = ""
+        safe_name = os.path.basename(raw_name)
         safe_name = re.sub(r'[^\w\.\-_ ]', '_', safe_name)
         if not safe_name:
             safe_name = "attachment"
@@ -1597,15 +1779,28 @@ async def save_attachment(
             return "Error: Attachment filename would escape the target directory."
 
         att.SaveAsFile(save_path)
+        try:
+            bytes_on_disk = os.path.getsize(save_path)
+        except OSError:
+            bytes_on_disk = None
+        try:
+            storage_size = int(att.Size or 0)
+        except Exception:
+            storage_size = None
         return json.dumps({
             "status": "saved",
             "filename": safe_name,
             "path": save_path,
-            "size": att.Size,
+            "com_index": com_index,
+            "storage_size": storage_size,
+            "bytes_on_disk": bytes_on_disk,
         }, indent=2, default=str)
 
     try:
-        return await bridge.call(_save, entry_id, attachment_index, save_directory, account)
+        return await bridge.call(
+            _save, entry_id, attachment_index, save_directory, account,
+            use_com_index,
+        )
     except Exception as e:
         return f"Error saving attachment: {format_com_error(e)}"
 

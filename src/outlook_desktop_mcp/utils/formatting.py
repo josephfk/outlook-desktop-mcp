@@ -8,6 +8,12 @@ from outlook_desktop_mcp.tools._folder_constants import (
     TASK_STATUS_NAMES,
     IMPORTANCE_NAMES,
 )
+from outlook_desktop_mcp.utils.attachments import (
+    attachment_counts,
+    classify_item_attachments,
+    serialize_attachments,
+)
+from outlook_desktop_mcp.utils.tasks import outlook_date_or_none
 
 
 def truncate(text: str, max_length: int = 2000) -> str:
@@ -65,7 +71,12 @@ def merge_categories(
 
 
 def format_email_summary(item) -> dict:
-    """Extract key fields from an Outlook MailItem into a dict."""
+    """Extract key fields from an Outlook MailItem into a dict.
+
+    attachment_count is the paperclip file count (signature/inline/OLE
+    parts excluded). raw_attachment_count is the unfiltered COM collection.
+    """
+    visible_count, raw_count = attachment_counts(item, match_html_cid=False)
     return {
         "entry_id": item.EntryID,
         "subject": item.Subject or "(no subject)",
@@ -73,18 +84,25 @@ def format_email_summary(item) -> dict:
         "sender_name": getattr(item, "SenderName", "unknown"),
         "received_time": str(item.ReceivedTime),
         "unread": bool(item.UnRead),
-        "has_attachments": bool(item.Attachments.Count > 0),
-        "attachment_count": item.Attachments.Count,
+        "has_attachments": visible_count > 0,
+        "attachment_count": visible_count,
+        "raw_attachment_count": raw_count,
         "categories": get_item_categories(item),
     }
 
 
 def format_email_full(item, body_max_length: int = 5000) -> dict:
-    """Extract full email details including body."""
+    """Extract full email details including body and visible attachments."""
     result = format_email_summary(item)
     result["to"] = item.To or ""
     result["cc"] = item.CC or ""
     result["body"] = truncate(item.Body or "", body_max_length)
+    rows = classify_item_attachments(item, match_html_cid=True)
+    visible = [row for row in rows if row.is_visible]
+    result["has_attachments"] = len(visible) > 0
+    result["attachment_count"] = len(visible)
+    result["raw_attachment_count"] = len(rows)
+    result["attachments"] = serialize_attachments(rows)
     return result
 
 
@@ -127,14 +145,14 @@ def format_event_full(item, body_max_length: int = 5000) -> dict:
 
 
 def format_task_summary(item) -> dict:
-    """Extract key fields from an Outlook TaskItem."""
+    """Extract key fields from an Outlook TaskItem into a dict."""
     return {
         "entry_id": item.EntryID,
         "subject": item.Subject or "(no subject)",
         "status": TASK_STATUS_NAMES.get(item.Status, "unknown"),
         "percent_complete": item.PercentComplete,
-        "due_date": str(item.DueDate) if str(item.DueDate) != "01/01/4501" else None,
-        "start_date": str(item.StartDate) if str(item.StartDate) != "01/01/4501" else None,
+        "due_date": outlook_date_or_none(item.DueDate),
+        "start_date": outlook_date_or_none(item.StartDate),
         "importance": IMPORTANCE_NAMES.get(item.Importance, "normal"),
         "complete": bool(item.Complete),
         "categories": get_item_categories(item),
@@ -143,11 +161,14 @@ def format_task_summary(item) -> dict:
 
 
 def format_task_full(item, body_max_length: int = 5000) -> dict:
-    """Full task details including body."""
+    """Full task details including body and reminder time."""
     result = format_task_summary(item)
     result["body"] = truncate(item.Body or "", body_max_length)
     result["reminder_set"] = bool(item.ReminderSet)
+    result["reminder_time"] = (
+        outlook_date_or_none(item.ReminderTime) if item.ReminderSet else None
+    )
     result["date_completed"] = (
-        str(item.DateCompleted) if item.Complete else None
+        outlook_date_or_none(item.DateCompleted) if item.Complete else None
     )
     return result

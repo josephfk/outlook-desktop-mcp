@@ -49,14 +49,14 @@ async def run_tests():
                 tools_result = await session.list_tools()
                 tool_names = [t.name for t in tools_result.tools]
                 expected = [
-                    "list_tasks", "get_task", "create_task", "complete_task",
-                    "delete_task", "list_attachments", "save_attachment",
-                    "list_categories", "set_category", "list_rules",
-                    "toggle_rule", "get_out_of_office",
+                    "list_tasks", "get_task", "create_task", "update_task",
+                    "complete_task", "delete_task", "list_attachments",
+                    "save_attachment", "list_categories", "set_category",
+                    "list_rules", "toggle_rule", "get_out_of_office",
                 ]
                 missing = [n for n in expected if n not in tool_names]
                 assert not missing, f"Missing tools: {missing}"
-                log(f"  All 12 new tools present (total: {len(tool_names)})")
+                log(f"  Expected extras tools present (total: {len(tool_names)})")
                 passed += 1
                 log("  PASS")
             except Exception as e:
@@ -146,7 +146,7 @@ async def run_tests():
                     atts = json.loads(result.content[0].text)
                     log(f"  Found {len(atts)} attachment(s):")
                     for a in atts:
-                        log(f"    [{a['index']}] {a['filename']} ({a['size']} bytes)")
+                        log(f"    [{a.get('visible_index')}] {a['filename']} (storage_size={a.get('storage_size')})")
                 else:
                     log("  No emails with attachments in top 50")
                 passed += 1
@@ -165,7 +165,7 @@ async def run_tests():
                         "save_directory": temp_dir,
                     })
                     data = json.loads(result.content[0].text)
-                    log(f"  Saved: {data['path']} ({data['size']} bytes)")
+                    log(f"  Saved: {data['path']} (bytes_on_disk={data.get('bytes_on_disk')})")
                     # Clean up
                     if os.path.exists(data['path']):
                         os.remove(data['path'])
