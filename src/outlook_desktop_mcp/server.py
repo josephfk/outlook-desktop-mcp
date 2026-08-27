@@ -51,6 +51,15 @@ from outlook_desktop_mcp.utils.attachments import (
     resolve_attachment_com_index,
     serialize_attachments,
 )
+from outlook_desktop_mcp.utils.mail import attach_local_files, finish_mail_item
+from outlook_desktop_mcp.utils.folders import folder_fields
+from outlook_desktop_mcp.utils.flags import apply_mail_flag, flag_info
+from outlook_desktop_mcp.utils.outlook_dates import (
+    dasl_filter,
+    dasl_received_clauses,
+    jet_start_range,
+    parse_filter_datetime,
+)
 from outlook_desktop_mcp.utils.tasks import (
     apply_task_fields,
     compute_reminder_time,
@@ -113,14 +122,18 @@ mcp = FastMCP(
         "PREREQUISITE: Outlook Desktop (Classic) must be running. The new/modern "
         "Outlook (olk.exe) is NOT supported — only the classic OUTLOOK.EXE.\n\n"
         "AVAILABLE TOOL CATEGORIES:\n"
-        "- Email: send, list, read, search, reply, mark read/unread, move, attachments\n"
+        "- Email: send (or save draft / display), list, read, search, reply, "
+        "mark read/unread, move, flag/follow-up, attachments\n"
         "- Calendar: list events, create appointments/meetings, update, delete, "
         "respond to invites, search events\n"
         "- Tasks: create, list, update, complete, delete to-do items\n"
         "- Categories: list and set color categories on any item\n"
         "- Rules: list and manage mail rules\n"
         "- Out of Office: check auto-reply status\n"
-        "- Folders: list folder hierarchy with item counts"
+        "- Folders: list folder hierarchy (unread counts; item_count only if requested)\n\n"
+        "list_emails/search_emails summaries include sender SMTP, a short "
+        "preview, conversation_id, and flag_status. After move_email, use the "
+        "returned entry_id — the previous id is invalid."
     ),
 )
 
@@ -280,11 +293,16 @@ async def send_email(
     bcc: str = "",
     html_body: str = "",
     account: str = "",
+    send: bool = True,
+    display: bool = False,
+    attachments: str = "",
 ) -> str:
-    """Send an email using the user's Outlook account.
+    """Create an email in Outlook: send it, save a draft, or open it on screen.
 
-    Creates and sends an email immediately through the default Outlook profile.
-    The email will appear in the user's Sent Items folder after sending.
+    Default send=true matches previous behaviour (send immediately). Pass
+    send=false to save a draft and get an entry_id. display=true opens a
+    modeless Outlook window so the user can review before sending; it is
+    ignored when send=true.
 
     Args:
         to: One or more recipient email addresses, separated by semicolons.
@@ -298,11 +316,18 @@ async def send_email(
             the email as HTML. The plain-text body serves as fallback.
         account: Optional. Account display name (or substring) to send from.
             Default: primary account. Use list_accounts to see available accounts.
+        send: If true (default), send immediately. If false, save to Drafts.
+        display: If true and send=false, open the draft in Outlook (modeless).
+        attachments: Optional. Local file paths to attach, separated by
+            semicolons. Example: "C:\\\\Docs\\\\a.pdf; C:\\\\Docs\\\\b.xlsx"
 
     Returns:
-        A confirmation message with subject and recipients, or an error.
+        JSON with status (sent or draft), subject, and entry_id for drafts.
     """
-    def _send(outlook, namespace, to, subject, body, cc, bcc, html_body, account):
+    def _send(
+        outlook, namespace, to, subject, body, cc, bcc, html_body, account,
+        send, display, attachments,
+    ):
         store = _require_store(namespace, account)
         mail = outlook.CreateItem(OL_MAIL_ITEM)
         # Set the sending account
@@ -319,11 +344,19 @@ async def send_email(
             mail.BCC = bcc
         if html_body:
             mail.HTMLBody = html_body
-        mail.Send()
-        return f"Email sent: '{subject}' to {to}"
+        attach_local_files(mail, attachments)
+        result = finish_mail_item(mail, send=send, display=display)
+        if result["status"] == "sent":
+            result["to"] = to
+        return json.dumps(result, indent=2, default=str)
 
     try:
-        return await bridge.call(_send, to, subject, body, cc, bcc, html_body, account)
+        return await bridge.call(
+            _send, to, subject, body, cc, bcc, html_body, account,
+            send, display, attachments,
+        )
+    except ValueError as e:
+        return f"Error sending email: {e}"
     except Exception as e:
         return f"Error sending email: {format_com_error(e)}"
 
@@ -344,8 +377,10 @@ async def list_emails(
     """List recent emails from a specified Outlook folder.
 
     Returns a JSON array of email summaries sorted by received time (newest
-    first). Each summary includes entry_id, subject, sender, sender_name,
-    received_time, unread status, visible attachment count, and categories.
+    first). Each summary includes entry_id, subject, sender (SMTP when
+    resolvable), sender_name, received_time, unread, visible attachment
+    count, categories, a short body preview, conversation_id, and flag
+    fields (flag_status, flagged_as_task, flag_due, flag_request).
     attachment_count is the paperclip file count; raw_attachment_count is
     the unfiltered COM collection (includes signature/inline images).
 
@@ -379,22 +414,15 @@ async def list_emails(
         items = target.Items
         items.Sort("[ReceivedTime]", True)
 
-        # Build restriction filters
-        restrictions = []
-        if unread_only:
-            restrictions.append("[UnRead] = True")
-        if start_date:
-            start = _parse_date(start_date)
-            restrictions.append(f"[ReceivedTime] >= '{start.strftime('%m/%d/%Y %H:%M')}'")
-        if end_date:
-            end = _parse_date(end_date)
-            restrictions.append(f"[ReceivedTime] <= '{end.strftime('%m/%d/%Y %H:%M')}'")
-        elif start_date:
-            # Default end to now when start is specified
-            restrictions.append(f"[ReceivedTime] <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'")
-
-        if restrictions:
-            items = items.Restrict(" AND ".join(restrictions))
+        start = parse_filter_datetime(start_date) if start_date else None
+        end = parse_filter_datetime(end_date) if end_date else None
+        if start is not None and end is None:
+            end = datetime.now()
+        filter_str = dasl_filter(dasl_received_clauses(
+            unread_only=unread_only, start=start, end=end,
+        ))
+        if filter_str:
+            items = items.Restrict(filter_str)
 
         results = []
         limit = min(count, items.Count)
@@ -440,9 +468,9 @@ async def read_email(
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
-        JSON object with full email details (entry_id, subject, sender,
-        sender_name, received_time, unread, to, cc, body, visible
-        attachments, and categories as an array).
+        JSON object with full email details (entry_id, subject, sender SMTP,
+        sender_name, received_time, unread, to, cc, body, preview,
+        conversation_id, visible attachments, and categories as an array).
     """
     def _read(outlook, namespace, entry_id, subject_search, folder, account):
         if entry_id:
@@ -566,7 +594,7 @@ async def move_email(
 
     Moves the specified email from its current location to the target folder.
     IMPORTANT: After moving, the email gets a NEW entry_id — the old one
-    becomes invalid. Common use: archiving emails after processing.
+    becomes invalid. Use the entry_id from the JSON result for later calls.
 
     Args:
         entry_id: The unique Outlook EntryID of the email to move.
@@ -577,10 +605,11 @@ async def move_email(
             the target folder in. Default: primary account.
 
     Returns:
-        Confirmation with email subject and destination, or an error.
+        JSON with status, subject, target_folder, entry_id (new), and
+        previous_entry_id.
     """
     def _move(outlook, namespace, entry_id, target_folder, account):
-        item = namespace.GetItemFromID(entry_id)
+        item = _get_item_from_id(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
@@ -590,8 +619,14 @@ async def move_email(
         if not dest:
             return f"Error: Target folder '{target_folder}' not found. Use list_folders to see available folders."
 
-        item.Move(dest)
-        return f"Moved '{subject}' to {target_folder}"
+        moved = item.Move(dest)
+        return json.dumps({
+            "status": "moved",
+            "subject": subject,
+            "target_folder": target_folder,
+            "entry_id": moved.EntryID,
+            "previous_entry_id": entry_id,
+        }, indent=2, default=str)
 
     try:
         return await bridge.call(_move, entry_id, target_folder, account)
@@ -609,11 +644,16 @@ async def reply_email(
     body: str,
     reply_all: bool = False,
     account: str = "",
+    send: bool = True,
+    display: bool = False,
+    attachments: str = "",
 ) -> str:
     """Reply to an email in Outlook.
 
-    Creates and sends a reply, preserving the original message thread.
-    Use reply_all=True to reply to all recipients (sender + CC list).
+    Creates a reply, preserving the original message thread. Default
+    send=true sends immediately. Pass send=false to save a draft (and
+    optionally display=true to open it in Outlook). Use reply_all=True
+    to reply to all recipients (sender + CC list).
 
     Args:
         entry_id: The unique Outlook EntryID of the email to reply to.
@@ -623,28 +663,100 @@ async def reply_email(
             If false (default), reply only to the sender.
         account: Optional. Account display name (or substring). Only needed
             if entry_id is ambiguous across stores.
+        send: If true (default), send immediately. If false, save a draft.
+        display: If true and send=false, open the draft in Outlook (modeless).
+        attachments: Optional. Local file paths to attach, separated by
+            semicolons.
 
     Returns:
-        Confirmation indicating the reply was sent, or an error.
+        JSON with status (sent or draft), subject, reply_all, and entry_id
+        for drafts.
     """
-    def _reply(outlook, namespace, entry_id, body, reply_all, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+    def _reply(
+        outlook, namespace, entry_id, body, reply_all, account,
+        send, display, attachments,
+    ):
+        item = _get_item_from_id(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
         reply_item = item.ReplyAll() if reply_all else item.Reply()
         reply_item.Body = body + "\n\n" + reply_item.Body
-        reply_item.Send()
-        return f"Reply sent to '{subject}' (reply_all={reply_all})"
+        attach_local_files(reply_item, attachments)
+        result = finish_mail_item(reply_item, send=send, display=display)
+        result["reply_all"] = reply_all
+        result["in_reply_to_subject"] = subject
+        return json.dumps(result, indent=2, default=str)
 
     try:
-        return await bridge.call(_reply, entry_id, body, reply_all, account)
+        return await bridge.call(
+            _reply, entry_id, body, reply_all, account,
+            send, display, attachments,
+        )
+    except ValueError as e:
+        return f"Error replying to email: {e}"
     except Exception as e:
         return f"Error replying to email: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def set_flag(
+    entry_id: str,
+    status: str,
+    due_date: str = "",
+    reminder: bool = False,
+    flag_request: str = "",
+    account: str = "",
+) -> str:
+    """Set, complete, or clear a follow-up flag on an email (To-Do bar).
+
+    Flagged mail appears in Outlook's To-Do bar without creating a separate
+    TaskItem. Use status='flagged' (aliases: follow_up, flag), 'complete'
+    (done), or 'clear' (unflag).
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email.
+        status: flagged, complete, or clear.
+        due_date: Optional. ISO 8601 due date/time for a follow-up
+            (e.g. "2026-03-12" or "2026-03-12 17:00").
+        reminder: If true, set a reminder at due_date (requires due_date).
+        flag_request: Optional. Flag caption. Default "Follow up".
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        JSON with subject and the resulting flag fields.
+    """
+    def _set(
+        outlook, namespace, entry_id, status, due_date, reminder,
+        flag_request, account,
+    ):
+        item = _get_item_from_id(namespace, entry_id, account)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+        apply_mail_flag(
+            item,
+            status=status,
+            due_date=due_date,
+            reminder=reminder,
+            flag_request=flag_request,
+        )
+        item.Save()
+        return json.dumps({
+            "status": "updated",
+            "subject": item.Subject or "(no subject)",
+            "entry_id": item.EntryID,
+            **flag_info(item),
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(
+            _set, entry_id, status, due_date, reminder, flag_request, account,
+        )
+    except ValueError as e:
+        return f"Error setting flag: {e}"
+    except Exception as e:
+        return f"Error setting flag: {format_com_error(e)}"
 
 
 # =====================================================================
@@ -652,7 +764,12 @@ async def reply_email(
 # =====================================================================
 
 @mcp.tool()
-async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") -> str:
+async def list_folders(
+    folder: str = "",
+    max_depth: int = 3,
+    account: str = "",
+    include_counts: bool = False,
+) -> str:
     """List mail folders in the user's Outlook mailbox.
 
     When called with no folder argument, lists top-level folders. Provide a
@@ -665,6 +782,10 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
     move_email, search_emails, etc. Use slash-delimited paths for nested
     folders (e.g. "Inbox/Receipts/2026").
 
+    By default only unread_count is included. Items.Count (item_count) is
+    expensive in Online/Exchange mode and can freeze Outlook; pass
+    include_counts=true only when you need totals.
+
     Args:
         folder: Optional. Folder to list children of. Supports folder names
             ("Inbox"), slash paths ("Inbox/Receipts"), or built-in names
@@ -673,12 +794,13 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
             Default 3. Set to 1 to see only immediate children.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        include_counts: If true, include item_count (slow). Default false.
 
     Returns:
-        JSON array of folder objects with name, full_path, item_count,
-        unread_count, and subfolders (if any).
+        JSON array of folder objects with name, full_path, unread_count,
+        subfolders (if any), and item_count when include_counts is true.
     """
-    def _list(outlook, namespace, folder, max_depth, account):
+    def _list(outlook, namespace, folder, max_depth, account, include_counts):
         max_depth = min(max(1, max_depth), 10)
         store = _require_store(namespace, account)
 
@@ -693,12 +815,9 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
 
         def walk(f, depth, path_prefix):
             current_path = f"{path_prefix}/{f.Name}" if path_prefix else f.Name
-            result = {
-                "name": f.Name,
-                "full_path": current_path,
-                "item_count": f.Items.Count,
-                "unread_count": f.UnReadItemCount,
-            }
+            result = folder_fields(
+                f, full_path=current_path, include_counts=include_counts,
+            )
             if depth < max_depth:
                 children = []
                 for i in range(f.Folders.Count):
@@ -721,7 +840,9 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
         return json.dumps(folders, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, folder, max_depth, account)
+        return await bridge.call(
+            _list, folder, max_depth, account, include_counts,
+        )
     except Exception as e:
         return f"Error listing folders: {format_com_error(e)}"
 
@@ -743,7 +864,7 @@ async def search_emails(
 
     Searches email subjects and bodies using Outlook's DASL filter.
     Results are sorted by received time (newest first). Each result includes
-    entry_id for further operations and categories as an array.
+    entry_id, sender SMTP, preview, conversation_id, and categories.
 
     Args:
         query: The search term (case-insensitive substring match).
@@ -769,26 +890,16 @@ async def search_emails(
             return json.dumps({"error": f"Folder '{folder}' not found"})
 
         safe_query = _safe_dasl(query)
+        start = parse_filter_datetime(start_date) if start_date else None
+        end = parse_filter_datetime(end_date) if end_date else None
+        if start is not None and end is None:
+            end = datetime.now()
         dasl_parts = [
             f"(\"urn:schemas:httpmail:subject\" LIKE '%{safe_query}%' OR "
             f"\"urn:schemas:httpmail:textdescription\" LIKE '%{safe_query}%')"
         ]
-        if start_date:
-            start = _parse_date(start_date)
-            dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" >= '{start.strftime('%m/%d/%Y %H:%M')}'"
-            )
-        if end_date:
-            end = _parse_date(end_date)
-            dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{end.strftime('%m/%d/%Y %H:%M')}'"
-            )
-        elif start_date:
-            dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'"
-            )
-
-        filter_str = "@SQL=" + " AND ".join(dasl_parts)
+        dasl_parts.extend(dasl_received_clauses(start=start, end=end))
+        filter_str = dasl_filter(dasl_parts)
         items = target.Items.Restrict(filter_str)
         items.Sort("[ReceivedTime]", True)
 
@@ -810,13 +921,6 @@ async def search_emails(
 # =====================================================================
 # CALENDAR TOOLS
 # =====================================================================
-
-
-# --- Helper: parse ISO date string ---
-
-def _parse_date(date_str: str) -> datetime:
-    """Parse ISO 8601 date string like '2026-02-25 14:00' or '2026-02-25T14:00:00'."""
-    return datetime.fromisoformat(date_str)
 
 
 # =====================================================================
@@ -861,14 +965,10 @@ async def list_events(
         items.Sort("[Start]")
         items.IncludeRecurrences = True
 
-        start = _parse_date(start_date) if start_date else datetime.now()
-        end = _parse_date(end_date) if end_date else start + timedelta(days=7)
+        start = parse_filter_datetime(start_date) if start_date else datetime.now()
+        end = parse_filter_datetime(end_date) if end_date else start + timedelta(days=7)
 
-        restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
-        )
-        filtered = items.Restrict(restrict)
+        filtered = items.Restrict(jet_start_range(start, end))
 
         results = []
         n = 0
@@ -1294,14 +1394,10 @@ async def search_events(
         items.Sort("[Start]")
         items.IncludeRecurrences = True
 
-        start = _parse_date(start_date) if start_date else datetime.now() - timedelta(days=30)
-        end = _parse_date(end_date) if end_date else datetime.now() + timedelta(days=30)
+        start = parse_filter_datetime(start_date) if start_date else datetime.now() - timedelta(days=30)
+        end = parse_filter_datetime(end_date) if end_date else datetime.now() + timedelta(days=30)
 
-        restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
-        )
-        filtered = items.Restrict(restrict)
+        filtered = items.Restrict(jet_start_range(start, end))
 
         query_lower = query.lower()
         results = []

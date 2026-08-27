@@ -86,6 +86,25 @@ OL_IMPORTANCE_HIGH = 2
 
 IMPORTANCE_NAMES = {0: "low", 1: "normal", 2: "high"}
 
+# OlFlagStatus
+OL_NO_FLAG = 0
+OL_FLAG_COMPLETE = 1
+OL_FLAG_MARKED = 2
+
+FLAG_STATUS_NAMES = {
+    0: "none",
+    1: "complete",
+    2: "flagged",
+}
+
+# OlMarkInterval (MailItem.MarkAsTask)
+OL_MARK_TODAY = 0
+OL_MARK_TOMORROW = 1
+OL_MARK_THIS_WEEK = 2
+OL_MARK_NEXT_WEEK = 3
+OL_MARK_NO_DATE = 4
+OL_MARK_COMPLETE = 5
+
 # OlRuleActionType (common ones)
 OL_RULE_ACTION_MOVE = 1
 OL_RULE_ACTION_DELETE = 8

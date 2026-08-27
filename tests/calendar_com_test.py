@@ -10,6 +10,8 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+from outlook_desktop_mcp.utils.outlook_dates import jet_start_range
+
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
@@ -42,11 +44,7 @@ def test_list_upcoming_events(namespace, days=7):
 
     start = datetime.now()
     end = start + timedelta(days=days)
-    restrict = (
-        f"[Start] >= '{start.strftime('%m/%d/%Y')}' "
-        f"AND [Start] <= '{end.strftime('%m/%d/%Y')}'"
-    )
-    filtered = items.Restrict(restrict)
+    filtered = items.Restrict(jet_start_range(start, end))
 
     count = 0
     for item in filtered:
@@ -72,11 +70,7 @@ def test_read_event_details(namespace):
 
     start = datetime.now()
     end = start + timedelta(days=30)
-    restrict = (
-        f"[Start] >= '{start.strftime('%m/%d/%Y')}' "
-        f"AND [Start] <= '{end.strftime('%m/%d/%Y')}'"
-    )
-    filtered = items.Restrict(restrict)
+    filtered = items.Restrict(jet_start_range(start, end))
 
     item = None
     for candidate in filtered:
@@ -193,11 +187,7 @@ def test_search_events(namespace, keyword="MCP"):
 
     start = datetime.now() - timedelta(days=30)
     end = datetime.now() + timedelta(days=30)
-    restrict = (
-        f"[Start] >= '{start.strftime('%m/%d/%Y')}' "
-        f"AND [Start] <= '{end.strftime('%m/%d/%Y')}'"
-    )
-    filtered = items.Restrict(restrict)
+    filtered = items.Restrict(jet_start_range(start, end))
 
     keyword_lower = keyword.lower()
     count = 0
